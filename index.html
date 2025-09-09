@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>缠论共振 · 自选跟踪（Lite）</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:12px}
+  textarea,input,select,button{font:inherit}
+  table{border-collapse:collapse; width:100%}
+  th,td{border:1px solid #ddd; padding:6px; font-size:14px}
+  th{background:#f6f7f9}
+  .ok{background:#10b98115}
+  .warn{background:#ef444415}
+  .dim{color:#666; font-size:12px}
+</style>
+<body>
+<h3>缠论共振 · 自选跟踪（Lite）</h3>
+
+<!-- 只改这里：换成你的 Worker 地址 -->
+<script>const WORKER_URL = 'https://github.com/haoouer/001.git';</script>
+
+<div>
+  <div class="dim">输入一行一个：代码(带sh/sz) 空格 名称</div>
+  <textarea id="watchlist" rows="6" style="width:100%;"
+placeholder="sh601600 中国铝业
+sz000630 铜陵有色
+sz159378 通用航空ETF
+sz159713 稀土ETF
+sh513060 恒生医疗ETF"></textarea>
+  <div style="margin:8px 0;">
+    周期：
+    <select id="period">
+      <option value="d1">日线</option>
+      <option value="m60">60分</option>
+      <option value="m30" selected>30分</option>
+      <option value="m15">15分</option>
+      <option value="m5">5分</option>
+    </select>
+    <button id="run">开始</button>
+    <button id="home">添加到主屏幕提示</button>
+  </div>
+</div>
+
+<table id="tbl">
+  <thead>
+    <tr>
+      <th>代码</th><th>名称</th><th>最新</th>
+      <th>MA6</th><th>MA12</th><th>MA24</th>
+      <th>BIAS6</th><th>BIAS12</th><th>BIAS24</th>
+      <th>判定</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const el = {
+  watch: document.getElementById('watchlist'),
+  period: document.getElementById('period'),
+  run: document.getElementById('run'),
+  body: document.querySelector('#tbl tbody'),
+  home: document.getElementById('home'),
+};
+
+function sma(arr, n){
+  if(!Array.isArray(arr) || arr.length < n) return null;
+  let s=0; for(let i=arr.length-n;i<arr.length;i++) s+=arr[i];
+  return s/n;
+}
+function bias(p, ma){ return (!ma||!isFinite(ma))? null : ((p-ma)/ma*100); }
+function fmt(x){ return (x==null||!isFinite(x))? '' : Number(x).toFixed(2); }
+
+async function fetchOne(symbol, period){
+  const url = `${WORKER_URL}?symbol=${encodeURIComponent(symbol)}&period=${period}&limit=300`;
+  const r = await fetch(url, {mode:'cors'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const data = await r.json();
+
+  // 兼容两种返回：1) Worker已算好 ma6/12/24；2) 只有 close 序列，前端补算
+  let latest = data.latest ?? (Array.isArray(data.close) ? data.close.at(-1) : null);
+  const closes = data.close ?? data.closes ?? data.c ?? [];
+  const ma6  = data.ma6  ?? sma(closes, 6);
+  const ma12 = data.ma12 ?? sma(closes, 12);
+  const ma24 = data.ma24 ?? sma(closes, 24);
+
+  return { latest, ma6, ma12, ma24 };
+}
+
+function decideBias(symbol, latest, ma6, ma12, ma24){
+  const isEtfOrBig = /^sz159|^sh5|ETF|etf|ETF$/.test(symbol);
+  const th = isEtfOrBig ? 4 : 6;           // 个股±6%，ETF/权重±4%
+  const b6  = bias(latest, ma6);
+  const b12 = bias(latest, ma12);
+  const b24 = bias(latest, ma24);
+  let label = '观望', cls = '';
+  if ((b6<=-th) || (b12<=-4) || (b24<=-4)) { label='超跌关注'; cls='ok'; }
+  if ((b6>= th) || (b12>= 4) || (b24>= 4)) { label='超涨警惕'; cls='warn'; }
+  return { b6,b12,b24,label,cls };
+}
+
+async function run(){
+  el.body.innerHTML = '';
+  const period = el.period.value;
+  const lines = el.watch.value.split('\n').map(s=>s.trim()).filter(Boolean);
+  for(const line of lines){
+    const [symbol, ...nameParts] = line.split(/\s+/);
+    const name = nameParts.join(' ') || symbol;
+    const tr = document.createElement('tr'); el.body.appendChild(tr);
+    const row = (a,b,c,d,e,f,g,h,i,j) => tr.innerHTML =
+      `<td>${a}</td><td>${b}</td><td>${fmt(c)}</td>
+       <td>${fmt(d)}</td><td>${fmt(e)}</td><td>${fmt(f)}</td>
+       <td>${fmt(g)}%</td><td>${fmt(h)}%</td><td>${fmt(i)}%</td>
+       <td class="${j.cls}">${j.label}</td>`;
+    try{
+      const {latest, ma6, ma12, ma24} = await fetchOne(symbol, period);
+      const dec = decideBias(symbol, latest, ma6, ma12, ma24);
+      row(symbol, name, latest, ma6, ma12, ma24, dec.b6, dec.b12, dec.b24, dec);
+    }catch(err){
+      row(symbol, name, NaN, NaN, NaN, NaN, NaN, NaN, NaN, {label:'错误',cls:'warn'});
+      console.error(symbol, err);
+    }
+  }
+}
+el.run.onclick = run;
+
+el.home.onclick = () => {
+  alert('在浏览器菜单中选择“添加到主屏幕”（Add to Home Screen），即可像App一样使用。');
+};
+</script>
+</body>
+</html>
