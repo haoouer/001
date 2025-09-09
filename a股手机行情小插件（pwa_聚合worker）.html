@@ -1,0 +1,397 @@
+<!--
+A股手机行情小插件（PWA + Cloudflare Worker）
+================================================
+功能：
+- 在手机浏览器里自动抓取多标的最新价、日/30分K线（用于 MA6/12/24）、计算 BIAS，并按“缠论共振2”的阈值上色提示。
+- 自选股可编辑，定时刷新。
+- 通过 Cloudflare Worker 做多数据源容错与 CORS 代理（优先腾讯，如果失败退新浪）。
+
+快速使用（3步）：
+1) 部署 Worker（见本文末尾 // ==== Worker 源码 ==== 处）。Cloudflare 控制台 -> Workers & Pages -> Create -> HTTP Router -> Quick edit 粘贴代码 -> Save & Deploy。
+2) 复制你的 Worker URL，例如：https://your-name.workers.dev/quote
+3) 本页 index.html 第 65 行把 WORKER_URL 改成你的地址，手机打开即可。
+
+温馨提示：
+- 由于第三方行情源可能限频/变更，Worker 内置多源兜底，且对每只标的按 260-300 根K线拉取（够算 MA24）。
+- 本页计算仅做技术参考，不构成投资建议。
+-->
+
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>缠论共振2 · 手机行情面板</title>
+  <style>
+    :root{--bg:#0b0e13;--card:#111621;--muted:#7e8aa0;--ok:#15b097;--warn:#e2b714;--bad:#ef5b7d;--text:#e6edf3;--grid:#1d2330}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto}
+    header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,var(--bg),rgba(11,14,19,.6));backdrop-filter:blur(6px);padding:10px 12px;border-bottom:1px solid var(--grid)}
+    h1{margin:4px 0 8px;font-size:18px}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    input,select,button,textarea{background:#0f1522;color:var(--text);border:1px solid #263149;border-radius:10px;padding:10px 12px;outline:none}
+    input::placeholder{color:#6b768c}
+    button{cursor:pointer} button.primary{background:#2456e6;border-color:#2d5bff} button.ghost{background:#0f1522}
+    main{padding:10px}
+    .card{background:var(--card);border:1px solid var(--grid);border-radius:14px;padding:10px;margin:10px 0}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid var(--grid);text-align:right;white-space:nowrap}
+    th{position:sticky;top:60px;background:var(--card);z-index:2}
+    td.code,th.code,td.name,th.name{text-align:left}
+    .tag{font-weight:700;border-radius:999px;padding:2px 8px;font-size:12px}
+    .buy{background:rgba(21,176,151,.15);color:var(--ok)} .sell{background:rgba(239,91,125,.15);color:var(--bad)} .hold{background:rgba(255,255,255,.08);color:#c7d2e3}
+    .muted{color:var(--muted)} .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
+    .small{font-size:12px}
+    details summary{cursor:pointer;user-select:none}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    @media (min-width:880px){.grid{grid-template-columns:1.2fr 2fr}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>缠论共振2 · 手机行情面板</h1>
+    <div class="row">
+      <input id="codes" style="flex:1" placeholder="代码或带交易所，如：sh601600,sz000630,sz159378" />
+      <select id="period">
+        <option value="m30" selected>30分</option>
+        <option value="day">日线</option>
+      </select>
+      <select id="typeMode" title="用于BIAS阈值：ETF/权重更保守">
+        <option value="auto" selected>类型自动</option>
+        <option value="all_stock">全部按个股</option>
+        <option value="all_index">全部按ETF/权重</option>
+      </select>
+      <input id="refresh" type="number" value="20" min="5" style="width:90px" />
+      <button id="btnRun" class="primary">开始</button>
+      <button id="btnStop" class="ghost">停止</button>
+    </div>
+    <div class="small muted" id="hint"></div>
+  </header>
+
+  <main>
+    <div class="card grid">
+      <div>
+        <div class="small muted">自选股（可直接编辑，回车保存）：</div>
+        <textarea id="watch" rows="4" style="width:100%;resize:vertical" placeholder="一行一个，可写备注名，用空格分隔\n示例：\nsh601600 中国铝业\nsz000630 铜陵有色\nsz159378 通用航空ETF\nsh516660 稀土ETF\nsh513060 恒生医疗ETF"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button id="btnSave">保存自选</button>
+          <span class="small muted">BIAS 阈值：个股 ±6%，ETF/权重 ±4%。MA 使用最近 24 根（30分/日线）收盘价。</span>
+        </div>
+      </div>
+      <div class="small muted">
+        <details open>
+          <summary>使用说明</summary>
+          <ul>
+            <li>先在右侧粘贴自选；点击“开始”。默认每 20 秒刷新一次。</li>
+            <li>若手机直连跨域被拦截，请务必按文末指引部署 Cloudflare Worker，并把 <code>WORKER_URL</code> 改成你的地址。</li>
+            <li>信号上色仅基于 BIAS 阈值；缠论买卖点仍建议你从盘面/分时确认。</li>
+          </ul>
+        </details>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row"><strong>实时列表</strong><span id="status" class="small muted"></span></div>
+      <div style="overflow:auto">
+        <table id="tbl">
+          <thead>
+            <tr>
+              <th class="code">代码</th>
+              <th class="name">名称</th>
+              <th>类型</th>
+              <th>价格</th>
+              <th>MA6</th>
+              <th>MA12</th>
+              <th>MA24</th>
+              <th>BIAS6</th>
+              <th>BIAS12</th>
+              <th>BIAS24</th>
+              <th>信号</th>
+              <th>时间</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <script>
+  // ====== 1) 配置：把下面 URL 换成你自己的 Worker 地址 ======
+  const WORKER_URL = 'https://your-name.workers.dev/quote'; // ←←← 替换这个
+
+  // ====== 2) 小工具 ======
+  const $ = (id)=>document.getElementById(id);
+  const toNum = (v)=>{const n=parseFloat(v);return Number.isFinite(n)?n:NaN}
+  const maN = (arr,n)=>{ if(!arr||arr.length<n) return NaN; let s=0; for(let i=arr.length-n;i<arr.length;i++) s+=toNum(arr[i]); return s/n }
+  const bias = (price, ma)=> (Number.isFinite(price)&&Number.isFinite(ma)&&ma!==0) ? (price-ma)/ma*100 : NaN
+  const fmt = (n)=> Number.isFinite(n) ? n.toFixed(2) : '-'
+  const now = ()=> new Date().toLocaleTimeString()
+
+  function guessType(code, typeMode){
+    if(typeMode==='all_stock') return '个股';
+    if(typeMode==='all_index') return 'ETF/权重';
+    // auto: 简单规则：15/51/56/159/513/516/588/56x => ETF；6xxxx=>沪A个股；0/3开头=>深A个股
+    const pure = code.replace(/^sh|^sz/,'');
+    if(/^((159|513|516|56|588|510|512)).*/.test(pure)) return 'ETF/权重';
+    return '个股';
+  }
+
+  function colorBias(val, type){
+    const abs = Math.abs(val);
+    const th = (type==='ETF/权重') ? 4 : 6; // 共振阈值
+    if(!Number.isFinite(val)) return '<span class="muted">-</span>'
+    const c = abs>=th ? (val<0? 'buy':'sell') : 'hold'
+    const t = (val>0? '+':'') + fmt(val)+'%'
+    return `<span class="tag ${c}">${t}</span>`
+  }
+
+  // 保存/加载自选
+  function loadWatch(){
+    const saved = localStorage.getItem('watchlist');
+    if(saved){ $('watch').value = saved; }
+    else{
+      $('watch').value = [
+        'sh601600 中国铝业',
+        'sz000630 铜陵有色',
+        'sz159378 通用航空ETF',
+        'sh516660 稀土ETF',
+        'sh513060 恒生医疗ETF'
+      ].join('\n')
+    }
+    // 同步输入框
+    syncCodesFromWatch();
+  }
+  function syncCodesFromWatch(){
+    const lines = $('watch').value.split(/\n+/).map(s=>s.trim()).filter(Boolean)
+    const codes = lines.map(l=>l.split(/\s+/)[0]).join(',')
+    $('codes').value = codes
+  }
+
+  // ====== 3) 拉取与渲染 ======
+  let timer=null;
+
+  async function fetchAll(){
+    const codes = $('codes').value.replace(/\s+/g,'')
+    if(!codes){$('status').textContent=''; return}
+    const period = $('period').value; // m30 / day
+    $('status').textContent=' 更新中…'
+    try{
+      const url = `${WORKER_URL}?codes=${encodeURIComponent(codes)}&period=${period}&kcount=300&v=${Date.now()}`
+      const resp = await fetch(url)
+      if(!resp.ok) throw new Error('Worker 接口不可用')
+      const data = await resp.json()
+      render(data)
+      $('status').textContent = ' 已更新 ' + now()
+    }catch(e){
+      console.error(e)
+      $('status').textContent=' 拉取失败：' + e.message
+    }
+  }
+
+  function render(data){
+    const lines = $('watch').value.split(/\n+/).map(s=>s.trim()).filter(Boolean)
+    const mapping = new Map();
+    for(const l of lines){ const [code,...rest] = l.split(/\s+/); mapping.set(code.toLowerCase(), rest.join(' ')) }
+
+    const typeMode = $('typeMode').value
+    const tbody = $('tbody');
+    tbody.innerHTML='';
+
+    (data.items||[]).forEach(item=>{
+      const code = item.code;
+      const name = mapping.get(code) || item.name || '';
+      const type = guessType(code, typeMode)
+      const price = toNum(item.price)
+      const closeSeries = (item.series||[]).map(r=>toNum(r[2])) // [time,open,close,high,low,vol]
+      const m6  = maN(closeSeries, 6)
+      const m12 = maN(closeSeries, 12)
+      const m24 = maN(closeSeries, 24)
+      const b6  = bias(price, m6)
+      const b12 = bias(price, m12)
+      const b24 = bias(price, m24)
+
+      // 简易信号（仅基于 BIAS 阈值）
+      const th = (type==='ETF/权重') ? 4 : 6
+      let sig='观望', cls='hold'
+      if(Number.isFinite(b6)&&Math.abs(b6)>=th){ sig = b6<0? '买点(BIAS)':'卖点(BIAS)'; cls = b6<0? 'buy':'sell' }
+
+      const tr = document.createElement('tr')
+      tr.innerHTML = `
+        <td class="code">${code}</td>
+        <td class="name">${name||'<span class=muted>—</span>'}</td>
+        <td>${type}</td>
+        <td class="mono">${fmt(price)}</td>
+        <td class="mono">${fmt(m6)}</td>
+        <td class="mono">${fmt(m12)}</td>
+        <td class="mono">${fmt(m24)}</td>
+        <td>${colorBias(b6,type)}</td>
+        <td>${colorBias(b12,type)}</td>
+        <td>${colorBias(b24,type)}</td>
+        <td><span class="tag ${cls}">${sig}</span></td>
+        <td class="small muted">${item.time||''}</td>
+      `
+      tbody.appendChild(tr)
+    })
+  }
+
+  // ====== 4) 事件与初始化 ======
+  $('btnRun').onclick = ()=>{
+    localStorage.setItem('watchlist',$('watch').value)
+    if(timer) clearInterval(timer)
+    fetchAll();
+    const sec = Math.max(5, parseInt($('refresh').value)||20)
+    timer = setInterval(fetchAll, sec*1000)
+    $('hint').textContent = '正在刷新（每 ' + sec + 's）…'
+  }
+  $('btnStop').onclick = ()=>{ if(timer) clearInterval(timer); $('hint').textContent='已停止' }
+  $('btnSave').onclick = ()=>{ localStorage.setItem('watchlist',$('watch').value); syncCodesFromWatch() }
+  $('watch').addEventListener('change', syncCodesFromWatch)
+
+  loadWatch();
+  
+  </script>
+
+  <!--
+  ==============================================================
+  ==== Cloudflare Worker 源码（复制到 Workers 即可部署） ====
+  ==============================================================
+  - 路由：/quote （也可直接根路径）
+  - Query 参数：
+      codes=sh601600,sz000630  （支持带 sh/sz 前缀；不带则按首位 6=sh，其它=sz）
+      period=m30 或 day        （返回对应周期的K线，series 用于算MA）
+      kcount=300               （返回K线条数，建议 120~400）
+  - 返回：
+    {
+      items:[{
+        code:'sh601600', name:'中国铝业', price:7.43, time:'2025-09-09 10:30:05',
+        series:[[t,o,c,h,l,v], ...]   // 最近kcount根（period 指定的周期）
+      }, ...]
+    }
+  注意：此 Worker 仅做技术学习，请遵循各数据源的服务条款与频控。
+  -->
+  <script type="text/plain" id="worker-code">
+  export default {
+    async fetch(request, env, ctx){
+      const url = new URL(request.url);
+      const path = url.pathname;
+      if(path !== '/' && !path.startsWith('/quote')) return new Response('ok', {status:200});
+
+      const codesParam = url.searchParams.get('codes') || '';
+      const period = (url.searchParams.get('period')||'m30').toLowerCase(); // m30/day
+      const kcount = parseInt(url.searchParams.get('kcount')||'300');
+
+      const rawCodes = codesParam.split(',').map(s=>s.trim()).filter(Boolean);
+      if(rawCodes.length===0){
+        return json({items:[]})
+      }
+      const codes = rawCodes.map(normCode);
+
+      const items = [];
+      for(const code of codes){
+        const one = await getOne(code, period, kcount);
+        items.push(one);
+      }
+      return json({items});
+
+      // ===== helpers =====
+      function json(obj){
+        return new Response(JSON.stringify(obj), {
+          headers:{'content-type':'application/json; charset=utf-8','access-control-allow-origin':'*'}
+        });
+      }
+      function normCode(s){
+        if(/^sh|^sz/i.test(s)) return s.toLowerCase();
+        const pure = s.replace(/\D/g,'');
+        const ex = pure.startsWith('6')? 'sh':'sz';
+        return `${ex}${pure}`;
+      }
+
+      async function getOne(code, period, kcount){
+        // 1) 现价/名称：优先腾讯快照
+        let snap = await safeFetchSnapTX(code);
+        if(!snap) snap = await safeFetchSnapSina(code);
+
+        // 2) K线：按周期从腾讯接口拉，如果失败退新浪（新浪分钟K线可用 m5，m15，m30；日线也可拉）
+        let series = await safeFetchKlineTX(code, period, kcount);
+        if(!series || series.length<24){
+          series = await safeFetchKlineSina(code, period, kcount);
+        }
+
+        return {
+          code,
+          name: snap?.name || '',
+          price: snap?.price ?? (series?.at(-1)?.[2] ? Number(series.at(-1)[2]) : null),
+          time: snap?.time || new Date().toISOString().replace('T',' ').slice(0,19),
+          series: Array.isArray(series)? series.slice(-kcount) : []
+        }
+      }
+
+      // ===== 现价/快照：腾讯 =====
+      async function safeFetchSnapTX(code){
+        try{
+          const u = `https://qt.gtimg.cn/q=${code}`; // 文本：v_sz000001="51~平安银行~..."
+          const r = await fetch(u);
+          if(!r.ok) throw 0; const text = await r.text();
+          const m = text.match(/=\"([^\"]+)\"/);
+          if(!m) throw 0; const parts = m[1].split('~');
+          const name = parts[1]||''; const price = Number(parts[3]||parts[1]);
+          const time = new Date().toISOString().replace('T',' ').slice(0,19);
+          return {name, price, time}
+        }catch(e){ return null }
+      }
+
+      // ===== 现价/快照：新浪 =====
+      async function safeFetchSnapSina(code){
+        try{
+          const u = `https://hq.sinajs.cn/list=${code}`; // var hq_str_sh601600="中国铝业,7.43,..."
+          const r = await fetch(u, {headers:{'referer':'https://finance.sina.com.cn/'}});
+          if(!r.ok) throw 0; const text = await r.text();
+          const m = text.match(/\"([^\"]+)\"/);
+          if(!m) throw 0; const parts = m[1].split(',');
+          const name = parts[0]||''; const price = Number(parts[3]||parts[1]);
+          const time = `${parts[30]||''} ${parts[31]||''}`.trim() || new Date().toISOString().replace('T',' ').slice(0,19);
+          return {name, price, time}
+        }catch(e){ return null }
+      }
+
+      // ===== K线：腾讯 =====
+      async function safeFetchKlineTX(code, period, kcount){
+        try{
+          let u;
+          if(period==='day'){
+            // 复权日K
+            u = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${code},day,2018-01-01,2030-12-31,${kcount}`
+          }else{ // m30
+            u = `https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param=${code},m30,,${kcount}`
+          }
+          const r = await fetch(u,{headers:{'referer':'https://gu.qq.com/'}});
+          if(!r.ok) throw 0; const j = await r.json();
+          const root = j.data?.[code];
+          const arr = (period==='day' ? root?.day : root?.m30) || [];
+          // arr item: ["2024-09-06", "7.44", "7.43", "7.55", "7.40", "123456"]
+          return arr.map(a=>[a[0], Number(a[1]), Number(a[2]), Number(a[3]), Number(a[4]), Number(a[5])]);
+        }catch(e){ return null }
+      }
+
+      // ===== K线：新浪（兜底） =====
+      async function safeFetchKlineSina(code, period, kcount){
+        try{
+          const map = {m30:'30', day:'d'}; const p = map[period]||'30';
+          const u = `https://finance.sina.com.cn/realstock/company/${code}/hisdata/klc_${p}.js?${Date.now()}`;
+          const r = await fetch(u,{headers:{'referer':'https://finance.sina.com.cn/'}});
+          if(!r.ok) throw 0; const text = await r.text();
+          // 文本里有 klines: [[time,open,high,low,close,volume],...]
+          const m = text.match(/klines\s*:\s*(\[[^]+\])/);
+          if(!m) throw 0; const kl = JSON.parse(m[1]);
+          return kl.map(a=>[a[0], Number(a[1]), Number(a[4]), Number(a[2]), Number(a[3]), Number(a[5])]);
+        }catch(e){ return null }
+      }
+    }
+  }
+  </script>
+
+  <footer class="small muted" style="text-align:center;padding:24px 12px">
+    <div>© 缠论共振操盘系统 · 本工具仅供研究学习，行情与指标可能延迟或失效，请谨慎使用。</div>
+  </footer>
+</body>
+</html>
